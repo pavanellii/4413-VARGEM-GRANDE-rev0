@@ -391,7 +391,7 @@ select.nota{width:58px}
 </style>
 
 <header class="top"><div class="top-in wrap" id="top"></div></header>
-<nav class="tabs"><div class="tabs-in wrap"><div id="tabs" class="tabs-l"></div><div class="hact"><span class="saved" id="saved"></span><button class="btn sm" data-a="undo" title="Desfazer (Ctrl+Z)">↶ Desfazer</button></div></div></nav>
+<nav class="tabs"><div class="tabs-in wrap"><div id="tabs" class="tabs-l"></div><div class="hact"><span class="saved" id="saved"></span><span id="cloudState"></span><button class="btn sm" id="cloudLogout" type="button" hidden>Sair</button><button class="btn sm" data-a="undo" title="Desfazer (Ctrl+Z)">↶ Desfazer</button></div></div></nav>
 <main class="wrap" id="view"></main>
 <div id="drawer" hidden></div>
 <div id="cal" hidden></div>
@@ -403,6 +403,28 @@ select.nota{width:58px}
 <div id="toast" class="toast" role="status" hidden></div>
 <input type="file" id="fileimp" accept=".json,application/json" hidden>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+#authGate{position:fixed;inset:0;z-index:1000;background:var(--bg);display:flex;align-items:center;justify-content:center;padding:20px}
+#authCard{width:min(420px,100%);background:var(--surface);border:1px solid var(--line);border-top:5px solid var(--mc);border-radius:12px;padding:26px;box-shadow:var(--shadow)}
+#authCard h2{font-size:26px;margin:0 0 5px}#authCard p{color:var(--muted);margin:0 0 18px}
+#authCard label{display:block;font-size:12px;color:var(--muted);margin:12px 0 5px}
+#authCard input{width:100%;padding:10px;border:1px solid var(--line);border-radius:6px;background:var(--surface-2)}
+#authCard button{width:100%;margin-top:16px;padding:10px;border:0;border-radius:6px;background:var(--mc);color:white;font-weight:700;cursor:pointer}
+#authMsg{font-size:12px;color:var(--bad);min-height:18px;margin-top:10px}
+#cloudState{font-size:11px;margin-left:8px;color:var(--band-muted)}
+</style>
+<div id="authGate">
+ <form id="authCard">
+  <div class="eyebrow">MONTCALM · VALE · 4413</div>
+  <h2>Programação Semanal</h2>
+  <p>Entre com seu usuário autorizado para acessar a programação compartilhada.</p>
+  <label for="authEmail">E-mail</label><input id="authEmail" type="email" autocomplete="username" required>
+  <label for="authPass">Senha</label><input id="authPass" type="password" autocomplete="current-password" required>
+  <button id="authSubmit" type="submit">Entrar</button>
+  <div id="authMsg" role="alert"></div>
+ </form>
+</div>
 <script>
 /* ===== Atividades da planilha PROGRAMAÇÃO ===== */
 const SRC={
@@ -461,7 +483,60 @@ let S=null;try{S=JSON.parse(localStorage.getItem(KEY))}catch(e){}
 if(!S||!Array.isArray(S.filtros)){let o=null;try{o=JSON.parse(localStorage.getItem(OLDKEY))}catch(e){}S=o&&Array.isArray(o.filtros)?migrate(o):defaultState()}
 S.aval=S.aval||{};
 let savedAt=null,saveErr=false;
-function save(){try{localStorage.setItem(KEY,JSON.stringify(S));savedAt=new Date();saveErr=false}catch(e){saveErr=true}}
+let cloudClient=null,cloudReady=false,cloudUser=null,cloudTimer=null,appChannel=null,cloudApplying=false;
+function save(){try{localStorage.setItem(KEY,JSON.stringify(S));savedAt=new Date();saveErr=false}catch(e){saveErr=true}
+  if(cloudReady&&!cloudApplying)queueCloudSave();
+}
+function queueCloudSave(){clearTimeout(cloudTimer);cloudTimer=setTimeout(pushCloud,650)}
+async function pushCloud(){if(!cloudReady||!cloudUser)return;setCloudLabel('Salvando na nuvem…');
+  const payload={id:1,dados:S,updated_at:new Date().toISOString(),updated_by:cloudUser.id};
+  const {error}=await cloudClient.from('programacao_4413').upsert(payload,{onConflict:'id'});
+  if(error){console.error(error);setCloudLabel('Erro ao salvar na nuvem');toast('Falha ao salvar na nuvem: '+error.message);return}
+  savedAt=new Date();setCloudLabel('Salvo na nuvem · '+savedAt.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}));
+}
+function setCloudLabel(t){const e=document.getElementById('cloudState');if(e)e.textContent=t;const s=document.getElementById('saved');if(s)s.textContent=t}
+async function loadCloudState(){
+  const {data,error}=await cloudClient.from('programacao_4413').select('dados').eq('id',1).maybeSingle();
+  if(error)throw error;
+  if(data&&data.dados&&Array.isArray(data.dados.filtros)){
+    cloudApplying=true;S=data.dados;S.aval=S.aval||{};localStorage.setItem(KEY,JSON.stringify(S));cloudApplying=false;
+  }else{
+    const {error:insErr}=await cloudClient.from('programacao_4413').upsert({id:1,dados:S,updated_at:new Date().toISOString(),updated_by:cloudUser.id},{onConflict:'id'});
+    if(insErr)throw insErr;
+  }
+}
+function startRealtime(){
+  if(appChannel)cloudClient.removeChannel(appChannel);
+  appChannel=cloudClient.channel('programacao-4413-sync').on('postgres_changes',{event:'*',schema:'public',table:'programacao_4413',filter:'id=eq.1'},payload=>{
+    if(!cloudReady||!payload.new||!payload.new.dados)return;
+    clearTimeout(cloudTimer);cloudApplying=true;S=payload.new.dados;S.aval=S.aval||{};try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}cloudApplying=false;
+    UNDO.length=0;setCloudLabel('Atualizado por outro usuário');scheduleRender();
+  }).subscribe();
+}
+async function enterApp(){
+  const gate=document.getElementById('authGate');const msg=document.getElementById('authMsg');
+  try{
+    const {data:{session},error}=await cloudClient.auth.getSession();if(error)throw error;
+    if(!session){gate.hidden=false;return}
+    cloudUser=session.user;await loadCloudState();cloudReady=true;gate.hidden=true;document.getElementById('cloudLogout').hidden=false;startRealtime();render();
+  }catch(e){console.error(e);msg.textContent='Não foi possível carregar a programação: '+e.message;gate.hidden=false}
+}
+async function initCloud(){
+  const SUPABASE_URL='https://gmphelmlgfdzfdrdefka.supabase.co';
+  const SUPABASE_KEY='sb_publishable_wFsjQKEtH0jQ9iKebjwdZQ_LKhORdUA';
+  if(!window.supabase||!window.supabase.createClient){document.getElementById('authMsg').textContent='Falha ao carregar a conexão. Verifique sua internet e atualize a página.';return}
+  cloudClient=window.supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
+  document.getElementById('cloudLogout').addEventListener('click',async()=>{await cloudClient.auth.signOut();location.reload()});
+  document.getElementById('authCard').addEventListener('submit',async ev=>{
+    ev.preventDefault();const b=document.getElementById('authSubmit'),msg=document.getElementById('authMsg');b.disabled=true;b.textContent='Entrando…';msg.textContent='';
+    const email=document.getElementById('authEmail').value.trim(),password=document.getElementById('authPass').value;
+    const {error}=await cloudClient.auth.signInWithPassword({email,password});
+    if(error){msg.textContent='E-mail ou senha inválidos, ou usuário não confirmado.';b.disabled=false;b.textContent='Entrar';return}
+    b.textContent='Carregando…';await enterApp();b.disabled=false;b.textContent='Entrar';
+  });
+  await enterApp();
+}
+
 const UNDO=[];
 function mut(fn,msg){UNDO.push(JSON.stringify(S));if(UNDO.length>80)UNDO.shift();fn();save();if(msg)toast(msg,true);scheduleRender()}
 function undo(){if(!UNDO.length){toast('Nada para desfazer');return}S=JSON.parse(UNDO.pop());save();toast('Alteração desfeita');scheduleRender()}
@@ -1962,5 +2037,5 @@ Object.assign(ACT,{
     mut(()=>{a.dur=String(Math.round(nd*2)/2)},'Término '+fD(dd)+' · '+dias(Math.round(nd*2)/2))},
 });
 
-render();
+initCloud();
 </script>
